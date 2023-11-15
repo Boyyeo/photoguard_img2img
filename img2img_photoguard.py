@@ -9,13 +9,15 @@ import torch
 import requests
 from tqdm import tqdm
 from io import BytesIO
-from diffusers import StableDiffusionImg2ImgPipeline
-import torchvision.transforms as T
+from pipeline_stable_diffusion_img2img import MyStableDiffusionImg2ImgPipeline
 from typing import Union, List, Optional, Callable
 from notebooks.utils import preprocess, prepare_mask_and_masked_image, recover_image, prepare_image, randn_tensor, evaluate_image
 import pandas as pd
 from absl import flags, app
 import random 
+import torchvision.transforms as T
+from typing import Any, Callable, Dict, List, Optional, Union
+
 to_pil = T.ToPILImage()
 
 FLAGS = flags.FLAGS
@@ -27,78 +29,103 @@ flags.DEFINE_integer('GPU_ID', 0, "rank of GPU used")
 flags.DEFINE_integer('num_test', 10, "number of seeds used to evaluate per image attack")
 
 
-
 # A differentiable version of the forward function of the inpainting stable diffusion model! See https://github.com/huggingface/diffusers
 def attack_forward(
-        self,
-        image,
-        prompt: Union[str, List[str]],
-        height: int = 512,
-        width: int = 512,
-        num_inference_steps: int = 50,
-        guidance_scale: float = 7.5,
-        eta: float = 0.0,
-    ):
+    self,
+    image = None,
+    prompt: Union[str, List[str]] = None,
+    strength: float = 1,
+    num_inference_steps: Optional[int] = 50,
+    guidance_scale: Optional[float] = 7.5,
+    negative_prompt: Optional[Union[str, List[str]]] = None,
+    num_images_per_prompt: Optional[int] = 1,
+    eta: Optional[float] = 0.0,
+    generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+    prompt_embeds: Optional[torch.FloatTensor] = None,
+    negative_prompt_embeds: Optional[torch.FloatTensor] = None,
+    callback_steps: int = 1,
+    cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+):
 
-        text_inputs = self.tokenizer(
-            prompt,
-            padding="max_length",
-            max_length=self.tokenizer.model_max_length,
-            return_tensors="pt",
-        )
-        text_input_ids = text_inputs.input_ids
-        text_embeddings = self.text_encoder(text_input_ids.to(self.device))[0]
+    # 1. Check inputs. Raise error if not correct
+    self.check_inputs(prompt, strength, callback_steps, negative_prompt, prompt_embeds, negative_prompt_embeds)
 
-        uncond_tokens = [""]
-        max_length = text_input_ids.shape[-1]
-        uncond_input = self.tokenizer(
-            uncond_tokens,
-            padding="max_length",
-            max_length=max_length,
-            truncation=True,
-            return_tensors="pt",
-        )
-        uncond_embeddings = self.text_encoder(uncond_input.input_ids.to(self.device))[0]
-        seq_len = uncond_embeddings.shape[1]
-        text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
-        
-        text_embeddings = text_embeddings.detach()
-
-        image_latents = self.vae.encode(image.unsqueeze(0)).latent_dist.sample()
-        image_latents = 0.18215 * image_latents
-        ############## TODO: Adding noise to latent image #################
-        shape = image_latents.shape
+    # 2. Define call parameters
+    if prompt is not None and isinstance(prompt, str):
         batch_size = 1
-        num_images_per_prompt = 1
-        strength = 0.7
+    elif prompt is not None and isinstance(prompt, list):
+        batch_size = len(prompt)
+    else:
+        batch_size = prompt_embeds.shape[0]
 
-        noise = randn_tensor(shape).to(self.device).half()
-        self.scheduler.set_timesteps(num_inference_steps, device=self.device)
-        timesteps, num_inference_steps = self.get_timesteps(num_inference_steps, strength, self.device)
-        latent_timestep = timesteps[:1].repeat(batch_size * num_images_per_prompt)
-        image_latents = self.scheduler.add_noise(image_latents, noise, latent_timestep)
-        latents = torch.cat([image_latents] * 2)
+    device = self.device
+    # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
+    # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
+    # corresponds to doing no classifier free guidance.
+    do_classifier_free_guidance = guidance_scale > 1.0
 
-        timesteps_tensor = self.scheduler.timesteps.to(self.device)
+    # 3. Encode input prompt
+    text_encoder_lora_scale = (
+        cross_attention_kwargs.get("scale", None) if cross_attention_kwargs is not None else None
+    )
+    prompt_embeds, negative_prompt_embeds = self.encode_prompt(
+        prompt,
+        device,
+        num_images_per_prompt,
+        do_classifier_free_guidance,
+        negative_prompt,
+        prompt_embeds=prompt_embeds,
+        negative_prompt_embeds=negative_prompt_embeds,
+        lora_scale=text_encoder_lora_scale,
+    )
+    # For classifier free guidance, we need to do two forward passes.
+    # Here we concatenate the unconditional and text embeddings into a single batch
+    # to avoid doing two forward passes
+    if do_classifier_free_guidance:
+        prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds])
 
-        for i, t in enumerate(timesteps_tensor):
+    # 4. Preprocess image
+    image = self.image_processor.preprocess(image)
 
-            ########## TODO: check whether *2 is required ##################
-            latent_model_input = latents#torch.cat([latents] * 2) 
-            noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample
+    # 5. set timesteps
+    self.scheduler.set_timesteps(num_inference_steps, device=device)
+    timesteps, num_inference_steps = self.get_timesteps(num_inference_steps, strength, device)
+    latent_timestep = timesteps[:1].repeat(batch_size * num_images_per_prompt)
+
+    # 6. Prepare latent variables
+    latents = self.prepare_latents(
+        image, latent_timestep, batch_size, num_images_per_prompt, prompt_embeds.dtype, device, generator
+    )
+
+    # 7. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
+    extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
+
+    # 8. Denoising loop
+    for i, t in enumerate(timesteps):
+        # expand the latents if we are doing classifier free guidance
+        latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+        latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+
+        # predict the noise residual
+        noise_pred = self.unet(
+            latent_model_input,
+            t,
+            encoder_hidden_states=prompt_embeds,
+            cross_attention_kwargs=cross_attention_kwargs,
+            return_dict=False,
+        )[0]
+
+        # perform guidance
+        if do_classifier_free_guidance:
             noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
             noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
-            
-            #### TODO: ETA ??? ###
-            #latents = self.scheduler.step(noise_pred, t, latents, eta=eta).prev_sample
-            latents = self.scheduler.step(noise_pred, t, latents).prev_sample
-            #######################
-            #count += 1
-        #print('count:',count)
 
-        latents = 1 / 0.18215 * latents
-        image = self.vae.decode(latents).sample
-        return image
+        # compute the previous noisy sample x_t -> x_t-1
+        latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
+
+
+    image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)
+    return image[0]
 
     
 def compute_grad(pipe_img2img, image, prompt, target_image, **kwargs):
@@ -111,6 +138,7 @@ def compute_grad(pipe_img2img, image, prompt, target_image, **kwargs):
                                **kwargs)
     
     loss = (image_nat - target_image).norm(p=2)
+    #print("image_nat:{} target:{}".format(image_nat.shape,target_image.shape))
     grad = torch.autograd.grad(loss, [image])[0] 
         
     return grad, loss.item(), image_nat.data.cpu()
@@ -181,7 +209,7 @@ def perform_attack():
     # make sure you're logged in with `huggingface-cli login` - check https://github.com/huggingface/diffusers for more details
     device = torch.device("cuda:{}".format(FLAGS.GPU_ID))
     model_id_or_path = "CompVis/stable-diffusion-v1-4"
-    pipe_img2img = StableDiffusionImg2ImgPipeline.from_pretrained(model_id_or_path, torch_dtype=torch.float16,revision="fp16")
+    pipe_img2img = MyStableDiffusionImg2ImgPipeline.from_pretrained(model_id_or_path, torch_dtype=torch.float16,revision="fp16")
     pipe_img2img = pipe_img2img.to(device)
 
     RANDOM_SEED_LIST = [0,1,2,3,4,5,6,7,8,9] 
@@ -192,7 +220,6 @@ def perform_attack():
     target_image_tensor = prepare_image(target_image)
     target_image_tensor = 0*target_image_tensor.to(device) # we can either attack towards a target image or simply the zero tensor
 
-    ORIGINAL_IMAGE_FOLDER = 'original_images'
     ORIGINAL_EDIT_IMAGE_FOLDER = FLAGS.out_dir + '/ORIGINAL_EDIT_IMAGE'
     ADVERSARIAL_IMAGE_FOLDER = FLAGS.out_dir + '/ADVERSARIAL_IMAGE'
     ADVERSARIAL_EDIT_IMAGE_FOLDER = FLAGS.out_dir + '/ADVERSARIAL_EDIT_IMAGE'
@@ -200,26 +227,26 @@ def perform_attack():
     os.makedirs(ADVERSARIAL_IMAGE_FOLDER, exist_ok=True)
     os.makedirs(ADVERSARIAL_EDIT_IMAGE_FOLDER, exist_ok=True)
 
-    lpips_list, psnr_list, ssim_list, vif_list, fsim_list, image_list = [],[],[],[],[],[]
+    lpips_list, psnr_list, ssim_index_list, ssim_loss_list, vif_index_list, vif_loss_list, fsim_index_list, fsim_loss_list, image_list = [],[],[],[],[],[]
     parsed_input_image_sequence = FLAGS.input_img.split('~')
     start_img_num = int(parsed_input_image_sequence[0])
     end_img_num = int(parsed_input_image_sequence[1])
 
 
     for i in range(start_img_num,end_img_num+1):
-        total_lpips_loss, total_psnr_index, total_ssim_index, total_vif_index, total_fsim_index = 0,0,0,0,0
-        image_path = 'original_images/dog_{}.png'
-        image_list.append(image_path.format(i))
-        init_image = Image.open(image_path.format(i)).convert('RGB').resize((512,512))
+        total_lpips_loss, total_psnr_index, total_ssim_index, total_vif_index, total_fsim_index, total_fsim_loss, total_ssim_loss, total_vif_loss = 0,0,0,0,0,0,0,0
+        image_path = 'original_images/dog_{}.png'.format(i)
+        image_list.append(image_path)
+        init_image = Image.open(image_path).convert('RGB').resize((512,512))
         image = prepare_image(init_image)
         image = image.half().to(device)
+        print("---------------------------------- CURRENT PROCESSING IMAGE: {} ----------------------------------".format(image_path))
 
         for k in range(FLAGS.num_test):
             path_template = '{}/dog_{}_seed_{}.png'
             SEED = RANDOM_SEED_LIST[k] #786349
             set_seed(SEED)
             prompt = ""
-            strength = 0.7
             guidance_scale = 7.5
             num_inference_steps = FLAGS.num_inference_step
 
@@ -231,7 +258,7 @@ def perform_attack():
                                 target_image=target_image_tensor,
                                 eps=16,
                                 step_size=1,
-                                iters=100,
+                                iters=200,
                                 clamp_min = -1,
                                 clamp_max = 1,
                                 eta=1,
@@ -245,9 +272,9 @@ def perform_attack():
                                 image,
                                 prompt=prompt,
                                 target_image=target_image_tensor,
-                                eps=0.1,
-                                step_size=0.006,
-                                iters=4,
+                                eps=0.006,
+                                step_size=0.001,
+                                iters=100,
                                 clamp_min = -1,
                                 clamp_max = 1,
                                 eta=1,
@@ -289,29 +316,38 @@ def perform_attack():
             image_adv.save(path_template.format(ADVERSARIAL_EDIT_IMAGE_FOLDER,i,k))
             image_adv = T.ToTensor()(image_adv)
 
-            lpips_loss, psnr_index, ssim_index, vif_index, fsim_index = evaluate_image(image_nat.unsqueeze(0),image_adv.unsqueeze(0))
+            lpips_loss, psnr_index, ssim_index, ssim_loss, vif_index, vif_loss, fsim_index, fsim_loss = evaluate_image(image_nat.unsqueeze(0),image_adv.unsqueeze(0))
             total_lpips_loss += lpips_loss.cpu().item()
             total_psnr_index += psnr_index.cpu().item()
             total_ssim_index += ssim_index.cpu().item()
+            total_ssim_loss  += ssim_loss.cpu().item()
             total_vif_index  += vif_index.cpu().item()
+            total_vif_loss   += vif_loss.cpu().item()
             total_fsim_index += fsim_index.cpu().item()
+            total_fsim_loss  += fsim_loss.cpu().item()
 
 
         lpips_list.append(round(total_lpips_loss/FLAGS.num_test,6))
         psnr_list.append(round(total_psnr_index/FLAGS.num_test,6))
-        ssim_list.append(round(total_ssim_index/FLAGS.num_test,6))
-        vif_list.append(round(total_vif_index/FLAGS.num_test,6))
-        fsim_list.append(round(total_fsim_index/FLAGS.num_test,6))
-    
+        ssim_index_list.append(round(total_ssim_index/FLAGS.num_test,6))
+        ssim_loss_list.append(round(total_ssim_loss/FLAGS.num_test,6))
+        vif_index_list.append(round(total_vif_index/FLAGS.num_test,6))
+        vif_loss_list.append(round(total_vif_loss/FLAGS.num_test,6))
+        fsim_index_list.append(round(total_fsim_index/FLAGS.num_test,6))
+        fsim_loss_list.append(round(total_fsim_loss/FLAGS.num_test,6))
+
 
     
     df_evaluation_metrics = pd.DataFrame(
     {'IMAGE_PATH':image_list,
      'LPIPS': lpips_list,
      'PSNR': psnr_list,
-     'SSIM': ssim_list,
-     'VIF': vif_list,
-     'FSIM': fsim_list
+     'SSIM_INDEX': ssim_index_list,
+     'SSIM_LOSS': ssim_loss_list,
+     'VIF_INDEX': vif_index_list,
+     'VIF_LOSS': vif_loss_list,
+     'FSIM_INDEX': fsim_index_list,
+     'FSIM_LOSS': fsim_loss_list,
     })        
 
     df_evaluation_metrics.to_csv(FLAGS.out_dir + '/eval_step_{}_sequences_{}.csv'.format(FLAGS.num_inference_step,FLAGS.input_img),index=False)

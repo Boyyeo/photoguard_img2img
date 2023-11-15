@@ -132,7 +132,7 @@ def evaluate_image(x,y):
     fsim_loss = piq.FSIMLoss(data_range=1., reduction='none')(x, y)
     #print(f"FSIM index: {fsim_index.item():0.4f}, loss: {fsim_loss.item():0.4f}")
 
-    return lpips_loss, psnr_index, ssim_index, vif_index, fsim_index
+    return lpips_loss, psnr_index, ssim_index, ssim_loss, vif_index, vif_loss, fsim_index, fsim_loss
 
 
 

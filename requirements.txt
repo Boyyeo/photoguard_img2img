@@ -1,0 +1,8 @@
+transformers
+scipy
+accelerate
+matplotlib
+piq
+scikit-image
+diffusers==0.21.0
+Pillow
