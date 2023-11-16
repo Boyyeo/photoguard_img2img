@@ -11,7 +11,7 @@ from tqdm import tqdm
 from io import BytesIO
 from pipeline_stable_diffusion_img2img import MyStableDiffusionImg2ImgPipeline
 from typing import Union, List, Optional, Callable
-from notebooks.utils import preprocess, prepare_mask_and_masked_image, recover_image, prepare_image, randn_tensor, evaluate_image
+from utils import preprocess, prepare_mask_and_masked_image, recover_image, prepare_image, randn_tensor, evaluate_image
 import pandas as pd
 from absl import flags, app
 import random 
@@ -227,7 +227,7 @@ def perform_attack():
     os.makedirs(ADVERSARIAL_IMAGE_FOLDER, exist_ok=True)
     os.makedirs(ADVERSARIAL_EDIT_IMAGE_FOLDER, exist_ok=True)
 
-    lpips_list, psnr_list, ssim_index_list, ssim_loss_list, vif_index_list, vif_loss_list, fsim_index_list, fsim_loss_list, image_list = [],[],[],[],[],[]
+    lpips_list, psnr_list, ssim_index_list, ssim_loss_list, vif_index_list, vif_loss_list, fsim_index_list, fsim_loss_list, image_list = [],[],[],[],[],[],[],[],[]
     parsed_input_image_sequence = FLAGS.input_img.split('~')
     start_img_num = int(parsed_input_image_sequence[0])
     end_img_num = int(parsed_input_image_sequence[1])
