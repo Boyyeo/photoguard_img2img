@@ -100,10 +100,10 @@ def randn_tensor(
 @torch.no_grad()
 def evaluate_image(x,y):
     # Read RGB image and it's noisy version
-    if torch.cuda.is_available():
+    #if torch.cuda.is_available():
         # Move to GPU to make computaions faster
-        x = x.cuda()
-        y = y.cuda()
+    #    x = x.cuda()
+    #    y = y.cuda()
    
     # To compute LPIPS as a loss function, use corresponding PyTorch module
     lpips_loss: torch.Tensor = piq.LPIPS(reduction='none')(x, y)

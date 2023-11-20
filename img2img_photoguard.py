@@ -176,6 +176,7 @@ def super_l2(pipe_img2img, X, prompt, step_size, iters, eps, clamp_min, clamp_ma
     return X_adv, last_image
 
 def super_linf(pipe_img2img, X, prompt, step_size, iters, eps, clamp_min, clamp_max, grad_reps = 5, target_image = 0, **kwargs):
+    #print("eps:{} step_size:{}".format(eps,step_size))
     X_adv = X.clone()
     last_image = None
     iterator = tqdm(range(iters))
@@ -272,8 +273,8 @@ def perform_attack():
                                 image,
                                 prompt=prompt,
                                 target_image=target_image_tensor,
-                                eps=0.006,
-                                step_size=0.001,
+                                eps=0.06,
+                                step_size=0.01,
                                 iters=100,
                                 clamp_min = -1,
                                 clamp_max = 1,
